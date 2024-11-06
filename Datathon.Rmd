@@ -1,0 +1,549 @@
+```{r}
+claims_data <- read.csv("C:/Users/zz012/Downloads/UNSW_claims_data.csv",header = TRUE)
+earned_data <- read.csv("C:/Users/zz012/Downloads/UNSW_earned_data_adjusted_Sep27.csv",header = TRUE)
+forecast_data<-read.csv("C:/Users/zz012/Downloads/New_Customers_Pricing_Output_File.csv",header = TRUE)
+```
+```{r}
+library(truncnorm)
+library(boot)
+library(dplyr)
+library(tidyr)
+library(glmnet)
+library(forcats)
+library(gbm)
+library(lubridate)
+library(ggplot2)
+library(gridExtra)
+library(pscl)
+library(MASS)
+```
+***STEP1 DATA CLEANING AND PROCESSING***
+
+*1.delete the negative tenure rows in claims and earned*
+*2.delete claims with zero total claim amount*
+*3.order the data based on exposure id and tenure add missing value as NA, check the data*
+*4. change missing owner age to the average and missing breed trait to "unknown",merge two data based on exposure id and tenure keep useful columns for following exploration(delete initial row number X, suburb name, policyholders' date of birth, extra breed name selected, duplicate exposure id, row number)*
+*4. add dummy variables for each category and prepare to fit a series of poisson with lasso regularization*
+
+```{r}
+earned_data <- earned_data %>%
+  filter(tenure >= 0)
+claims_data <- claims_data %>%
+  filter(tenure>= 0)
+claims_data <- claims_data %>%
+  filter(total_claim_amount > 0)
+sorted_df1 <- earned_data %>%
+    arrange(exposure_id, tenure)
+sorted_df2 <-claims_data %>%
+    arrange(exposure_id,tenure)
+sorted_df1[sorted_df1 == ""] <- NA
+sorted_df2[sorted_df2 == ""] <- NA
+mean_age <- mean(sorted_df1$owner_age_years, na.rm = TRUE)
+sorted_df1 <- sorted_df1 %>%
+  mutate( owner_age_years= ifelse(is.na(owner_age_years), mean_age, owner_age_years))
+sorted_df1 <- sorted_df1 %>%
+  mutate(nb_breed_trait = ifelse(is.na(nb_breed_trait), "unknown", nb_breed_trait))
+sorted_df1 <- sorted_df1 %>%
+    mutate(pet_is_switcher = ifelse(is.na(pet_is_switcher), "unknown", pet_is_switcher))
+earned_with_claim_info <- sorted_df1 %>%
+  left_join(sorted_df2 %>% 
+              dplyr::select(exposure_id,tenure,condition_category, claim_paid, total_claim_amount,claim_start_date)  %>% mutate(claim_happened = 1),
+            by = c("exposure_id", "tenure"))
+earned_with_claim_info <- earned_with_claim_info[,-c(1,14,17,26,31,32)]
+earned_with_claim_info <-earned_with_claim_info %>%
+  mutate( condition_category= ifelse(is.na(condition_category), "NA", condition_category))
+
+dummy_vars <- model.matrix(~ condition_category - 1, data = earned_with_claim_info)
+earned_with_claim_info2<-cbind(earned_with_claim_info,dummy_vars)
+earned_with_claim_info2<-earned_with_claim_info2[,-41]
+# Now you can group and summarize
+claims_per_exposure2 <- earned_with_claim_info2 %>%
+  group_by(exposure_id,tenure) %>%
+  summarize(
+    claim_count = sum(claim_happened, na.rm = TRUE),                # Count number of claims
+    avg_claim_amount = mean(total_claim_amount[claim_happened == 1], na.rm = TRUE),  # Average claim size for claims that happened
+  )
+claims_per_exposure <- earned_with_claim_info2 %>%
+  group_by(exposure_id, tenure) %>%
+  summarize(
+   across(c(31:41),~ sum(., na.rm = TRUE), .names = "{.col}_count"),  # Count how many claims in each specified column
+ across(c(31:41), ~ mean(total_claim_amount[. == 1], na.rm = TRUE), .names = "{.col}_average_claim") ,
+  ) %>%
+  ungroup()
+earned_with_claim_info2 <- sorted_df1 %>%
+  left_join(claims_per_exposure, by = c("exposure_id", "tenure"))%>%
+  left_join(claims_per_exposure2, by = c("exposure_id", "tenure"))
+earned_with_claim_info2 <- earned_with_claim_info2 %>%
+  mutate(de_sex_condition = ifelse(pet_de_sexed == "false", "no", pet_de_sexed_age))
+earned_with_claim_info2$UW_Date <- as.POSIXct( earned_with_claim_info2$UW_Date, format = "%Y-%m-%d %H:%M:%S")
+ earned_with_claim_info2$months <- format(earned_with_claim_info2$UW_Date, "%m") 
+earned_with_claim_info2 <- earned_with_claim_info2 %>%
+  mutate(de_sex_condition = recode(de_sex_condition,
+                                   "0-3 months" = "0-3 mo",
+                                   "7-12 months" = "7-12 mo",
+                                   "1-2 years" = "1-2 yr",
+                                   "2+ years" = "2+ yr"))
+earned_with_claim_info2 <- earned_with_claim_info2 %>%
+  mutate(pet_age_month_updating = tenure + pet_age_months)
+
+```
+```{r}
+earned_with_claim_info2[, c(5, 8, 13, 16, 18, 23, 24,25,27,59,58 )] <- 
+  lapply(earned_with_claim_info2[, c(5, 8, 13, 16,18, 23, 24,25,27,59,58)], as.factor)
+earned_with_claim_info2<-earned_with_claim_info2%>%
+  filter(earned_units>0.01)
+earned_with_claim_info2 <- earned_with_claim_info2 %>%
+  mutate(nb_breed_name_unique = fct_lump_min(nb_breed_name_unique, min = 50))
+earned_with_claim_info3<-earned_with_claim_info2%>%
+    filter(avg_claim_amount!="NaN")
+names_less_than_50 <- earned_with_claim_info2 %>%
+  group_by(nb_breed_name_unique) %>%
+  summarise(count = n()) %>%
+  filter(count < 50) %>%
+  pull(nb_breed_name_unique)
+```
+```{r}
+forecast_data2 <- forecast_data[!forecast_data$nb_breed_trait %in% c('siamese', 'forest cat', 'spotted cats', 'persian', 'burmese'), ]
+forecast_data2[forecast_data2 == ""] <- NA
+forecast_data2 <-forecast_data2 %>%
+  mutate_all(~ ifelse(. == "FALSE", "false", .))%>%
+  mutate_all(~ ifelse(. == "TRUE", "true", .))
+forecast_data2<- forecast_data2 %>%
+  mutate( owner_age_years= ifelse(is.na(owner_age_years), mean_age, owner_age_years))
+forecast_data2 <- forecast_data2 %>%
+  mutate(nb_breed_trait = ifelse(is.na(nb_breed_trait), "unknown", nb_breed_trait))
+forecast_data2 <- forecast_data2 %>%
+    mutate(pet_is_switcher = ifelse(is.na(pet_is_switcher), "unknown", pet_is_switcher))
+forecast_data2 <- forecast_data2 %>%
+  mutate(de_sex_condition = ifelse(pet_de_sexed == "false", "no", pet_de_sexed_age))
+forecast_data2 <- forecast_data2 %>%
+  mutate(de_sex_condition = recode(de_sex_condition,
+                                   "0-3 months" = "0-3 mo",
+                                   "7-12 months" = "7-12 mo",
+                                   "1-2 years" = "1-2 yr",
+                                   "2+ years" = "2+ yr"))
+forecast_data2$earned_units<-1
+forecast_data2 <- forecast_data2 %>%
+  mutate(nb_breed_name_unique = ifelse(nb_breed_name_unique %in% names_less_than_50, "Other", nb_breed_name_unique))
+names(forecast_data2)[6] <- c("pet_age_month_updating")
+forecast_data2[, c(2,5, 9, 12, 14, 19, 20, 21,23,28 )] <- 
+  lapply(forecast_data2[, c(2,5, 9, 12, 14, 19, 20, 21,23,28 )], as.factor)
+training_levels <- levels(factor(earned_with_claim_info2$nb_breed_name_unique))
+forecast_data2$nb_breed_name_unique <- fct_other(forecast_data2$nb_breed_name_unique, keep = training_levels, other_level = "Other")
+x_final_1 <- model.matrix( ~de_sex_condition+is_multi_pet_plan+ nb_breed_trait+
+  nb_breed_name_unique+ 
+  nb_breed_type+ 
+  nb_number_of_breeds+
+  owner_age_years+ 
+  nb_state+ 
+  nb_address_type_adj+ 
+  pet_is_switcher+ 
+  pet_gender+ 
+  pet_age_month_updating+ 
+  nb_average_breed_size+
+  nb_contribution_excess+earned_units , data = forecast_data2)
+x_final_2<-model.matrix( ~de_sex_condition+is_multi_pet_plan+ nb_breed_trait+
+  nb_breed_name_unique+ 
+  nb_breed_type+ 
+  nb_number_of_breeds+
+  owner_age_years+ 
+  nb_state+ 
+  nb_address_type_adj+ 
+  pet_is_switcher+ 
+  pet_gender+ 
+  pet_age_month_updating+ 
+  nb_average_breed_size+
+  nb_contribution_excess , data = forecast_data2)
+```
+***STEP1.5 FIGURE OUT HOW TO GET THE CLAIM_PAID KNOWING TOTAL_CLAIM_AMOUNT***
+
+```{r}
+earned_with_claim_info_cal <- earned_with_claim_info %>%
+  group_by(exposure_id, condition_category) %>%
+  arrange(claim_start_date)%>%
+  
+  # Step 1: Identify the occurrence (first, second, etc.)
+  mutate(occurrence = row_number()) %>%
+  mutate(paid = ifelse(occurrence == 1,
+                      ifelse(total_claim_amount > nb_excess,0.92*(total_claim_amount - nb_excess / 1.1) * nb_contribution / 100,0),0))%>%
+  mutate(previous_paid=0)
+  for (i in 2:max(earned_with_claim_info_cal$occurrence)) {
+earned_with_claim_info_cal<- earned_with_claim_info_cal%>%
+  mutate(previous_paid = ifelse(occurrence == i,cummax(paid),previous_paid))%>% 
+  mutate(paid = ifelse(occurrence == i,
+                      ifelse(total_claim_amount > nb_excess,
+                             ifelse(previous_paid > 0,0.92*total_claim_amount * nb_contribution / 100,0.92*(total_claim_amount - nb_excess / 1.1) * nb_contribution / 100),paid),paid))}
+  earned_with_claim_info_cal$paid_erro<-earned_with_claim_info_cal$paid-earned_with_claim_info_cal$claim_paid
+ earned_with_claim_info_cal<-filter(earned_with_claim_info_cal,paid_erro!="NA")
+  summary(earned_with_claim_info_cal$paid_erro)
+  qqnorm(earned_with_claim_info_cal$paid_erro)
+qqline(earned_with_claim_info_cal$paid_erro, col = "red")
+#delete the outlier
+earned_with_claim_info_cal<-earned_with_claim_info_cal[earned_with_claim_info_cal$paid_erro<2000,]
+earned_with_claim_info_cal<-earned_with_claim_info_cal[earned_with_claim_info_cal$paid_erro>-2000,]
+qqnorm(earned_with_claim_info_cal$paid_erro)
+qqline(earned_with_claim_info_cal$paid_erro, col = "red")
+```
+
+```{r}
+x_test_1 <- model.matrix(claim_count ~de_sex_condition+is_multi_pet_plan+ nb_breed_trait+
+  nb_breed_name_unique+ 
+  nb_breed_type+ 
+  nb_number_of_breeds+
+  owner_age_years+ 
+  nb_state+ 
+  nb_address_type_adj+ 
+  pet_is_switcher+ 
+  pet_gender+ 
+  pet_age_month_updating+ 
+  nb_average_breed_size+
+  nb_contribution_excess+earned_units , data = earned_with_claim_info2)
+x_test <- model.matrix(claim_count ~de_sex_condition+is_multi_pet_plan+ nb_breed_trait+
+  nb_breed_name_unique+ 
+  nb_breed_type+ 
+  nb_number_of_breeds+
+  owner_age_years+ 
+  nb_state+ 
+  nb_address_type_adj+ 
+  pet_is_switcher+ 
+  pet_gender+ 
+  pet_age_month_updating+ 
+  nb_average_breed_size+
+  nb_contribution_excess , data = earned_with_claim_info2)
+```
+***STEP2 FIT MODELS IN BOTH FREQUENCY AND SEVERITY***
+```{r}
+response_vars_sev <- c("condition_categoryAllergies & skin_average_claim", "condition_categoryBehavioral Issues_average_claim","condition_categoryDental_average_claim","condition_categoryEyes & ears_average_claim","condition_categoryGastrointestinal Issues_average_claim","condition_categoryIllness_average_claim","condition_categoryIngestion_average_claim","condition_categoryInjuries_average_claim","condition_categoryOrtho_average_claim","condition_categoryOther_average_claim","condition_categoryRoutine Care and Examinations_average_claim","avg_claim_amount")
+predictor_formula_sev <- ~ de_sex_condition + is_multi_pet_plan + nb_breed_trait +
+  nb_breed_name_unique + nb_breed_type + nb_number_of_breeds +
+  owner_age_years + nb_state + nb_address_type_adj +
+  pet_is_switcher + pet_gender + pet_age_month_updating +
+  nb_average_breed_size + nb_contribution_excess
+x_list_sev <- list()
+y_list_sev <- list()
+for (response_var in response_vars_sev) {
+    y <- earned_with_claim_info3[[response_var]]
+    y <- y[!is.na(y)]
+    y_list_sev[[response_var]] <- y  # Store y in the list with the response variable name
+    # Filter data to remove rows with NA in the response variable
+    data_filtered <- earned_with_claim_info3[!is.na(earned_with_claim_info3[[response_var]]), ]
+    x_list_sev[[response_var]] <- model.matrix(predictor_formula_sev, data = data_filtered)  # Store x in the list with the response variable name
+  }
+```
+```{r}
+model_list_sev <- list()
+cv_sev_errors <- list()
+predict_sev <- list()
+# Loop over each pair of x and y in the lists
+for (i in seq_along(x_list_sev)) {
+  # Extract the x and y for this iteration
+  y <- y_list_sev[[i]]
+  x <- x_list_sev[[i]]
+  cv_sev_model <- cv.glmnet(x, y, family = "gaussian", alpha = 1, nfolds = 10) 
+  # Fit a Poisson glmnet model
+  sev_model <- glmnet(x, y, family = "gaussian", alpha = 1,lambda = cv_sev_model$lambda.min)
+  cv_sev_errors[[names(y_list_sev)[i]]] <- cv_sev_model$cvm
+ sev_prediction <- predict(sev_model,newx = x_test,type="response")
+  model_list_sev[[names(y_list_sev)[i]]] <- sev_model
+  predict_sev[[names(y_list_sev)[i]]]<-  sev_prediction
+}
+
+```
+```{r}
+response_vars_fre <- c("condition_categoryAllergies & skin_count", "condition_categoryBehavioral Issues_count","condition_categoryDental_count","condition_categoryEyes & ears_count","condition_categoryGastrointestinal Issues_count","condition_categoryIllness_count","condition_categoryIngestion_count","condition_categoryInjuries_count","condition_categoryOrtho_count","condition_categoryOther_count","condition_categoryRoutine Care and Examinations_count","claim_count")
+predictor_formula_fre <- ~ de_sex_condition + is_multi_pet_plan + nb_breed_trait +
+  nb_breed_name_unique + nb_breed_type + nb_number_of_breeds +
+  owner_age_years + nb_state + nb_address_type_adj +
+  pet_is_switcher + pet_gender + pet_age_month_updating +
+  nb_average_breed_size + nb_contribution_excess+earned_units
+ x <- model.matrix(predictor_formula_fre, data = earned_with_claim_info2)
+y_list_fre <- list()
+for (response_var in response_vars_fre) {
+    y <- earned_with_claim_info2[[response_var]]
+    y_list_fre[[response_var]] <- y  # Store y in the list with the response variable name
+  }
+```
+```{r}
+model_list_fre <- list()
+cv_fre_errors <- list()
+cv_fre_minlambda <- list()
+predict_fre <- list()
+# Loop over each pair of x and y in the lists
+for (i in seq_along(y_list_fre)) {
+  # Extract the x and y for this iteration
+  y <- y_list_fre[[i]]
+  cv_fre_model <- cv.glmnet(x, y, family = "poisson", alpha = 1, nfolds = 10) 
+  # Fit a Poisson glmnet model
+  fre_model <- glmnet(x, y, family = "poisson", alpha = 1,lambda = cv_fre_model$lambda.min)
+  cv_fre_errors[[names(y_list_fre)[i]]] <- cv_fre_model$cvm
+  cv_fre_minlambda[[names(y_list_fre)[i]]] <- cv_fre_model$lambda.min
+  # Store the fitted model in model_list with the name of the response variable
+  model_list_fre[[names(y_list_fre)[i]]] <- fre_model
+  fre_prediction <- predict(fre_model, newx=x_test_1)
+  predict_fre[[names(y_list_fre)[i]]]<-  fre_prediction
+}
+exp_list_fre <- lapply(predict_fre, exp)
+total_claim_individual<-mapply("*",exp_list_fre[1:11],predict_sev[1:11])
+row_sum_vector <- rowSums(total_claim_individual)
+sum(row_sum_vector)
+total_claim_sum<-mapply("*",exp_list_fre[12],predict_sev[12])
+sum(total_claim_sum)
+trueprice<-sum(earned_with_claim_info3$claim_count*earned_with_claim_info3$avg_claim_amount)
+print(trueprice)
+mu_hat <- predict(model_list_fre[[12]], newx=x_test_1, type = "response")
+# Calculate the log-likelihood for Poisson
+log_likelihood <- sum(earned_with_claim_info2$claim_count * log(mu_hat) - mu_hat - lfactorial(earned_with_claim_info2$claim_count))
+# Calculate the effective number of parameters (including intercept)
+coefficients <- coef(model_list_fre[[12]])
+k <- sum(coefficients != 0)
+
+# Calculate AIC
+aic <- -2 * log_likelihood + 2 * k
+print(aic)
+```
+
+```{r}
+initial_model_lnorm <- glm(log(avg_claim_amount) ~ 1, data = earned_with_claim_info3, family = gaussian())
+full_model_lnorm <- glm(log(avg_claim_amount) ~de_sex_condition+is_multi_pet_plan+ nb_breed_trait+
+  nb_breed_name_unique+ 
+  nb_breed_type+ 
+  nb_number_of_breeds+
+  owner_age_years+ 
+  nb_state+ 
+  nb_address_type_adj+ 
+  pet_is_switcher+ 
+  pet_gender+ 
+  pet_age_month_updating+ 
+  nb_average_breed_size+
+  nb_contribution_excess , data = earned_with_claim_info3 , family = gaussian())
+
+# Forward Stepwise Selection
+step_model_lnorm <- stepAIC(initial_model_lnorm, 
+                      scope = list(lower = initial_model_lnorm, upper = full_model_lnorm),
+                      direction = "forward")
+
+# Summary of the selected model
+summary(step_model_lnorm)
+```
+```{r}
+initial_model_gamma <- glm(avg_claim_amount ~ 1, data = earned_with_claim_info3, family =  Gamma(link = "log"))
+full_model_gamma <- glm(avg_claim_amount ~de_sex_condition+is_multi_pet_plan+ nb_breed_trait+
+  nb_breed_name_unique+ 
+  nb_breed_type+ 
+  nb_number_of_breeds+
+  owner_age_years+ 
+  nb_state+ 
+  nb_address_type_adj+ 
+  pet_is_switcher+ 
+  pet_gender+ 
+  pet_age_month_updating+ 
+  nb_average_breed_size+
+  nb_contribution_excess , data = earned_with_claim_info3 , family =  Gamma(link = "log"))
+
+# Forward Stepwise Selection
+step_model_gamma <- stepAIC(initial_model_gamma, 
+                      scope = list(lower = initial_model_gamma, upper = full_model_gamma),
+                      direction = "forward")
+
+# Summary of the selected model
+summary(step_model_gamma)
+```
+```{r}
+initial_model_norm <- glm(avg_claim_amount ~ 1, data = earned_with_claim_info3, family = gaussian())
+full_model_norm <- glm(avg_claim_amount ~de_sex_condition+is_multi_pet_plan+ nb_breed_trait+
+  nb_breed_name_unique+ 
+  nb_breed_type+ 
+  nb_number_of_breeds+
+  owner_age_years+ 
+  nb_state+ 
+  nb_address_type_adj+ 
+  pet_is_switcher+ 
+  pet_gender+ 
+  pet_age_month_updating+ 
+  nb_average_breed_size+
+  nb_contribution_excess , data = earned_with_claim_info3 , family = gaussian())
+
+# Forward Stepwise Selection
+step_model_norm <- stepAIC(initial_model_norm, 
+                      scope = list(lower = initial_model_norm, upper = full_model_norm),
+                      direction = "forward")
+
+# Summary of the selected model
+summary(step_model_norm)
+```
+
+```{r}
+earned_with_claim_info4 <- earned_with_claim_info3 %>%
+  mutate(nb_breed_trait = fct_lump_min(nb_breed_trait, min = 10))
+set.seed(234)
+train_val_shuffle <- earned_with_claim_info4[sample(1:nrow(earned_with_claim_info4)), ]
+k <- 5
+fold_size <- floor(nrow(earned_with_claim_info4) / k)
+mse_lnorm <- numeric(k)
+mse_gamma <- numeric(k)
+mse_norm<- numeric(k)
+for (i in 1:k) {
+  val_indices <- ((i - 1) * fold_size + 1):(i * fold_size)
+  val <- train_val_shuffle[val_indices, ]
+  train <- train_val_shuffle[-val_indices, ] 
+  model_lnorm<-glm(formula = log(avg_claim_amount) ~ nb_contribution_excess + 
+    nb_breed_trait + nb_number_of_breeds + pet_is_switcher + 
+    pet_age_month_updating + nb_breed_type, family = gaussian(), 
+    data = train)
+  model_gamma<-glm(formula = avg_claim_amount ~ nb_contribution_excess + pet_age_month_updating, 
+    family = Gamma(link = "log"), data = train)
+ model_norm<- glm(formula = avg_claim_amount ~ nb_contribution_excess + pet_age_month_updating, 
+    family = gaussian(), data = train)
+  mse_norm[i] <- mean((predict(model_norm, newdata = val) - val$avg_claim_amount)^2)
+  mse_lnorm[i] <- mean((predict(model_lnorm, newdata = val) - val$avg_claim_amount)^2)
+  mse_gamma[i] <- mean((predict(model_gamma, newdata = val) - val$avg_claim_amount)^2)
+}
+mse_norm
+mse_lnorm
+mse_gamma
+c(mean(mse_lnorm), mean(mse_gamma),mean(mse_norm))
+```
+```{r}
+gbm_model <- gbm(
+  formula = avg_claim_amount ~de_sex_condition+is_multi_pet_plan+ nb_breed_trait+
+  nb_breed_name_unique+ 
+  nb_breed_type+ 
+  nb_number_of_breeds+
+  owner_age_years+ 
+  nb_state+ 
+  nb_address_type_adj+ 
+  pet_is_switcher+ 
+  pet_gender+ 
+  pet_age_month_updating+ 
+  nb_average_breed_size+
+  nb_contribution_excess ,         # Target variable and predictors
+  distribution = "gaussian",  # For regression
+  data = earned_with_claim_info3,                # Data frame
+  n.trees = 1000,             # Number of trees
+  interaction.depth = 3,      # Tree depth
+  shrinkage = 0.01,           # Learning rate
+  n.minobsinnode = 10,        # Minimum observations in nodes
+  cv.folds = 5,               # Number of cross-validation folds
+  verbose = TRUE              # Print progress
+)
+severity<- predict(gbm_model,newdata =earned_with_claim_info2 )
+sum(exp_list[[12]]*severity)
+```
+```{r}
+mu<-mean(earned_with_claim_info2$claim_count)
+sigma2<-var(earned_with_claim_info2$claim_count)
+print(mu)
+print(sigma2)
+```
+```{r}
+initial_model_p <- glm(claim_count ~ 1, data = earned_with_claim_info2, family = poisson(link = "log"))
+full_model_p <- glm(claim_count ~de_sex_condition+is_multi_pet_plan+ nb_breed_trait+
+  nb_breed_name_unique+ 
+  nb_breed_type+ 
+  nb_number_of_breeds+
+  owner_age_years+ 
+  nb_state+ 
+  nb_address_type_adj+ 
+  pet_is_switcher+ 
+  pet_gender+ 
+  pet_age_month_updating+ 
+  nb_average_breed_size+
+  nb_contribution_excess+earned_units , data = earned_with_claim_info2 , family = poisson(link = "log"))
+
+# Forward Stepwise Selection
+step_model_p <- stepAIC(initial_model_p, 
+                      scope = list(lower = initial_model_p, upper = full_model_p),
+                      direction = "forward")
+
+# Summary of the selected model
+summary(step_model_p)
+```
+```{r}
+initial_model_nb <- glm.nb(claim_count ~ 1, data = earned_with_claim_info2)
+full_model_nb <- glm.nb(claim_count ~de_sex_condition+is_multi_pet_plan+ nb_breed_trait+
+  nb_breed_name_unique+ 
+  nb_breed_type+ 
+  nb_number_of_breeds+
+  owner_age_years+ 
+  nb_state+ 
+  nb_address_type_adj+ 
+  pet_is_switcher+ 
+  pet_gender+ 
+  pet_age_month_updating+ 
+  nb_average_breed_size+
+  nb_contribution_excess+earned_units , data = earned_with_claim_info2 )
+
+# Forward Stepwise Selection
+step_model_nb <- stepAIC(initial_model_nb, 
+                      scope = list(lower = initial_model_nb, upper = full_model_nb),
+                      direction = "forward")
+
+# Summary of the selected model
+summary(step_model_nb)
+```
+```{r}
+vuong(step_model_p, step_model_nb)
+
+```
+```{r}
+mu_hat <- predict(step_model_nb, type = "response")
+lambda_hat <- predict(step_model_p, type = "response")
+theta <- 1 / step_model_nb$theta 
+claim_0 <- sum(earned_with_claim_info2$claim_count == 0)
+claim_1 <- sum(earned_with_claim_info2$claim_count == 1)
+claim_2 <- sum(earned_with_claim_info2$claim_count == 2)
+claim_3 <- sum(earned_with_claim_info2$claim_count == 3)
+claim_4 <- sum(earned_with_claim_info2$claim_count == 4)
+claim_5 <- sum(earned_with_claim_info2$claim_count == 5)
+E_nb_0 <- sum(dnbinom(0, size = theta, mu = mu_hat))
+E_nb_1 <- sum(dnbinom(1, size = theta, mu = mu_hat))  
+E_nb_2 <- sum(dnbinom(2, size = theta, mu = mu_hat)) 
+E_nb_3 <- sum(dnbinom(3, size = theta, mu = mu_hat)) 
+E_nb_4 <- sum(dnbinom(4, size = theta, mu = mu_hat))
+E_nb_5 <- sum(dnbinom(5, size = theta, mu = mu_hat))
+E_p_0 <- sum(dpois(0, lambda = lambda_hat))
+E_p_1 <- sum(dpois(1, lambda = lambda_hat))  
+E_p_2 <- sum(dpois(2, lambda = lambda_hat))  
+E_p_3 <- sum(dpois(3, lambda = lambda_hat))
+E_p_4 <- sum(dpois(4, lambda = lambda_hat))
+E_p_5 <- sum(dpois(5, lambda = lambda_hat))
+NB<-c(E_nb_0,E_nb_1,E_nb_2,E_nb_3,E_nb_4,E_nb_5)
+names(NB) <- c("y = 0", "y = 1", "y = 2", "y = 3","y = 4","y = 5")
+POI<-c(E_p_0,E_p_1,E_p_2,E_p_3,E_p_4,E_p_5)
+names(POI) <- c("y = 0", "y = 1", "y = 2", "y = 3","y = 4","y = 5")
+Real_data<-c(claim_0,claim_1,claim_2,claim_3,claim_4,claim_5)
+names(POI) <- c("y = 0", "y = 1", "y = 2", "y = 3","y = 4","y = 5")
+E_table <- data.frame(NB,POI,Real_data) 
+E_table$NB <- format(E_nb_table$NB, scientific = FALSE, digits = 5)
+E_table$POI <- format(E_p_table$POI, scientific = FALSE, digits = 5)
+
+print(E_table)
+```
+```{r}
+fre_nb<-predict(step_model_nb,newdata = earned_with_claim_info2,type = "response")
+estimateprice<-sum(fre_nb*predict_sev[[12]])
+print(estimateprice)
+```
+***STEP3 FINAL PREDICTION***
+```{r}
+lambda0<-predict(model_list_fre[[12]],newx=x_final_1,type="response")
+E_p_0 <- dpois(0, lambda = lambda0)
+E_p_1 <- dpois(1, lambda = lambda0)  
+E_p_2 <- dpois(2, lambda = lambda0)  
+set.seed(123)
+random_amounts_1 <- rlnorm(nrow(forecast_data2), meanlog = log(mean(earned_with_claim_info3$avg_claim_amount)), sdlog = sd(log(earned_with_claim_info3$avg_claim_amount)))
+random_amounts_2 <- rlnorm(nrow(forecast_data2), meanlog = log(mean(earned_with_claim_info3$avg_claim_amount)), sdlog = sd(log(earned_with_claim_info3$avg_claim_amount)))
+forecast_data2$e_values<-0
+for (i in 1:nrow(forecast_data2)) {
+  forecast_data2$e_values[i] <- E_p_0 [i]*0+E_p_1 [i]*ifelse(random_amounts_1[i] > forecast_data2$nb_excess[i],0.92*(random_amounts_1[i] - forecast_data2$nb_excess[i] / 1.1) * forecast_data2$nb_contribution[i] / 100,0) + E_p_2 [i]*ifelse(random_amounts_1[i] > forecast_data2$nb_excess[i],0.92*(random_amounts_1[i] - forecast_data2$nb_excess[i] / 1.1) * forecast_data2$nb_contribution[i] / 100+0.92*random_amounts_2[i] * forecast_data2$nb_contribution[i] / 100,ifelse(random_amounts_2[i] > forecast_data2$nb_excess[i],0.92*(random_amounts_2[i] - forecast_data2$nb_excess[i] / 1.1) * forecast_data2$nb_contribution[i] / 100,0))
+}
+sum(lambda0*random_amounts_1)
+sum(forecast_data2$e_values)
+forecast_data<- forecast_data[!forecast_data$nb_breed_trait %in% c('siamese', 'forest cat', 'spotted cats', 'persian', 'burmese'), ]
+merged_data <- forecast_data %>%
+  mutate(Full_month_premium=forecast_data2$e_values)
+write.csv(merged_data, "output_5305.csv", row.names = FALSE)
+```
+
+
+
